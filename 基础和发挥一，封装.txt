@@ -1,0 +1,814 @@
+import cv2
+import numpy as np
+
+# 帧宽和高度
+width = 640
+height = 480
+
+num = 1
+
+# 中心区域放大参数
+ZOOM_FACTOR = 2.0  # 放大倍数
+CENTER_CROP_SIZE = 300  # 中心裁剪区域大小（像素）
+
+def get_center_crop_and_zoom(frame, crop_size, zoom_factor):
+    """
+    从帧中心裁剪指定大小的区域并放大
+    """
+    h, w = frame.shape[:2]
+    
+    # 计算中心区域的坐标
+    center_x, center_y = w // 2, h // 2
+    half_crop = crop_size // 2
+    
+    # 确保裁剪区域不超出图像边界
+    x1 = max(0, center_x - half_crop)
+    y1 = max(0, center_y - half_crop)
+    x2 = min(w, center_x + half_crop)
+    y2 = min(h, center_y + half_crop)
+    
+    # 裁剪中心区域
+    center_crop = frame[y1:y2, x1:x2]
+    
+    # 放大裁剪区域
+    if center_crop.size > 0:
+        new_width = int(center_crop.shape[1] * zoom_factor)
+        new_height = int(center_crop.shape[0] * zoom_factor)
+        zoomed = cv2.resize(center_crop, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+        return zoomed, (x1, y1, x2, y2)
+    else:
+        return frame, (0, 0, w, h)
+
+# 简化图像预处理（只保留基本的灰度转换和二值化）
+def preprocess_frame(frame):
+    # RGB转灰度
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # 高斯滤波去噪（减少噪声影响）
+    blurred = cv2.GaussianBlur(gray, (5, 5), 2)
+    
+    # 二值化处理，直接用于矩形检测
+    _, binary = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
+    
+    return gray, binary
+
+# 矩形边框检测函数
+def detect_rectangles(binary):
+    # 查找轮廓（直接使用二值化图像）
+    contours, _ = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    rectangles = []
+    for contour in contours:
+        # 轮廓近似（使用更精确的参数）
+        epsilon = 0.015 * cv2.arcLength(contour, True)  # 降低epsilon获得更精确的近似
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        
+        # 检查是否为4边形（矩形）
+        if len(approx) == 4:
+            # 获取矩形的边界框
+            rect = cv2.boundingRect(approx)
+            width, height = rect[2], rect[3]
+            area = width * height
+            
+            # 添加面积阈值判断（适合远距离检测）
+            min_area = 500  # 最小面积阈值
+            if area < min_area:
+                print(f"外围矩形被剔除: 面积{area}像素²小于阈值{min_area}")
+                continue
+            
+            # 计算长宽比
+            aspect_ratio = max(width, height) / min(width, height)
+            
+            # 设置有效的长宽比范围（1.0到2.5之间，更严格）
+            # 1.0是正方形，2.5是2.5:1的矩形
+            if 1.5 <= aspect_ratio <= 2.5:
+                # 计算四条边的长度
+                points = approx.reshape(-1, 2)
+                edge_lengths = []
+                for i in range(4):
+                    p1 = points[i]
+                    p2 = points[(i + 1) % 4]
+                    length = np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+                    edge_lengths.append(length)
+                
+                # 检查对应边长是否相近（对边应该相等）
+                # 对边1和对边3，对边2和对边4
+                side1_diff = abs(edge_lengths[0] - edge_lengths[2]) / max(edge_lengths[0], edge_lengths[2])
+                side2_diff = abs(edge_lengths[1] - edge_lengths[3]) / max(edge_lengths[1], edge_lengths[3])
+                
+                # 对应边长差异阈值（更严格的10%以内认为合理）
+                edge_tolerance = 0.10
+                
+                if side1_diff <= edge_tolerance and side2_diff <= edge_tolerance:
+                    # 检查角度是否接近直角
+                    angles = []
+                    for i in range(4):
+                        p1 = points[i]
+                        p2 = points[(i + 1) % 4]
+                        p3 = points[(i + 2) % 4]
+                        
+                        # 计算两个向量
+                        v1 = p1 - p2
+                        v2 = p3 - p2
+                        
+                        # 计算角度
+                        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+                        cos_angle = np.clip(cos_angle, -1.0, 1.0)  # 防止数值误差
+                        angle_deg = np.degrees(np.arccos(abs(cos_angle)))
+                        angles.append(angle_deg)
+                    
+                    # 检查所有角度是否接近90度（容差15度）
+                    angle_tolerance = 15.0
+                    valid_angles = all(abs(angle - 90.0) <= angle_tolerance for angle in angles)
+                    
+                    if valid_angles:
+                        print(f"检测到有效矩形: 长宽比{aspect_ratio:.2f}, 边长差异{side1_diff:.3f}/{side2_diff:.3f}, 角度{angles}")
+                        rectangles.append(approx)
+                    else:
+                        print(f"矩形被剔除: 角度不是直角 {angles}")
+                else:
+                    print(f"矩形被剔除: 边长差异过大 {side1_diff:.3f}/{side2_diff:.3f} (阈值{edge_tolerance})")
+            else:
+                print(f"矩形被剔除: 长宽比{aspect_ratio:.2f}超出范围[1.0, 2.5]")
+    
+    return rectangles
+
+# 计算像素到厘米的转换比例（基于内矩形）
+def calculate_pixel_to_cm_ratio_inner(rectangles):
+    """根据检测到的内矩形计算像素到厘米的转换比例"""
+    if len(rectangles) >= 2:
+        # 按面积排序，取较小的作为内边缘
+        rectangles_with_area = [(rect, cv2.contourArea(rect)) for rect in rectangles]
+        rectangles_with_area.sort(key=lambda x: x[1])
+        inner_rectangle = rectangles_with_area[0][0]  # 最小的矩形
+        print("使用内边缘矩形进行尺寸标定")
+    else:
+        inner_rectangle = rectangles[0]
+        print("使用单个矩形进行尺寸标定")
+    
+    x, y, w, h = cv2.boundingRect(inner_rectangle)
+    
+    # 内矩形标准尺寸（厘米）
+    INNER_WIDTH_CM = 25.7   # 内矩形宽度
+    INNER_HEIGHT_CM = 17.0  # 内矩形高度
+    
+    # 计算像素到厘米的比例
+    pixel_to_cm_width = INNER_WIDTH_CM / w
+    pixel_to_cm_height = INNER_HEIGHT_CM / h
+    pixel_to_cm_ratio = (pixel_to_cm_width + pixel_to_cm_height) / 2
+    
+    print(f"内矩形检测尺寸: {w}×{h} 像素")
+    print(f"内矩形标准尺寸: {INNER_WIDTH_CM}×{INNER_HEIGHT_CM} cm")
+    print(f"像素到厘米转换比例: {pixel_to_cm_ratio:.4f} cm/pixel")
+    print(f"宽度比例: {pixel_to_cm_width:.4f}, 高度比例: {pixel_to_cm_height:.4f}")
+    
+    return pixel_to_cm_ratio
+
+
+# 内部基础图形检测函数
+def detect_inner_shapes(binary, rectangles):
+    """检测矩形内部的基础图形：圆形、正方形、三角形"""
+    all_shapes = []
+    
+    # 计算像素到厘米转换比例
+    pixel_to_cm_ratio = calculate_pixel_to_cm_ratio_inner(rectangles)
+    
+    # 如果有两个矩形，使用内边缘（较小的矩形）
+    if len(rectangles) >= 2:
+        # 按面积排序，取较小的作为内边缘
+        rectangles_with_area = [(rect, cv2.contourArea(rect)) for rect in rectangles]
+        rectangles_with_area.sort(key=lambda x: x[1])
+        target_rectangle = rectangles_with_area[0][0]  # 最小的矩形
+        print("检测到多个矩形，使用内边缘进行内部图形检测")
+    else:
+        target_rectangle = rectangles[0]
+        print("检测到单个矩形，直接进行内部图形检测")
+    
+    # 提取ROI区域
+    x, y, w, h = cv2.boundingRect(target_rectangle)
+    roi_binary = binary[y:y+h, x:x+w]
+    
+    # 在ROI内查找轮廓
+    contours, _ = cv2.findContours(roi_binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    
+    print(f"在ROI内找到 {len(contours)} 个轮廓")
+    
+    for i, contour in enumerate(contours):
+        area = cv2.contourArea(contour)
+        
+        print(f"轮廓{i}: 面积{area}像素²")
+        
+        # 过滤过小的轮廓（去除噪声）
+        if area < 100:
+            print(f"  -> 轮廓{i}被过滤: 面积太小({area} < 100)")
+            continue
+            
+        # 过滤边界轮廓（避免检测到矩形边界） - 使用很小的边界或不使用
+        contour_bbox = cv2.boundingRect(contour)
+        margin = 3  # 使用很小的边界值
+        if (contour_bbox[0] < margin or contour_bbox[1] < margin or
+            contour_bbox[0] + contour_bbox[2] > w - margin or
+            contour_bbox[1] + contour_bbox[3] > h - margin):
+            # 只过滤面积很大的边界轮廓（可能是矩形边界）
+            if area > w * h * 0.7:  # 只有当面积超过ROI的70%时才过滤
+                print(f"过滤大面积边界轮廓: 面积{area}像素²")
+                continue
+        
+        # 轮廓近似获取顶点（放宽参数减少顶点数量）
+        epsilon = 0.042 * cv2.arcLength(contour, True)  # 增大epsilon减少顶点数量
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        vertices = len(approx)
+        perimeter = cv2.arcLength(contour, True)
+        
+        print(f"  -> 轮廓{i}: {vertices}个顶点, 周长{perimeter:.1f}, epsilon={epsilon:.2f}")
+        
+        # 调整坐标到原图
+        approx_adjusted = approx + [x, y]
+
+        
+        # 三角形检测
+        if vertices == 3:
+            print(f"发现3个顶点的轮廓，面积{area}像素²，周长{perimeter:.1f}像素")
+            # 计算三条边的长度
+            points = approx.reshape(-1, 2)
+            side_lengths = []
+            for i in range(3):
+                p1 = points[i]
+                p2 = points[(i + 1) % 3]
+                length = np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+                side_lengths.append(length)
+            
+            # 取最短边长
+            min_side_pixels = int(min(side_lengths))
+            min_side_cm = min_side_pixels * pixel_to_cm_ratio
+            
+            all_shapes.append(('triangle', approx_adjusted, min_side_pixels, min_side_cm))
+            print(f"检测到三角形: 最短边长{min_side_pixels}像素 ({min_side_cm:.2f}cm)")
+            continue
+        
+        # 正方形/矩形检测
+        if vertices == 4:
+            rect_shape = cv2.boundingRect(approx)
+            width_rect, height_rect = rect_shape[2], rect_shape[3]
+            aspect_ratio = max(width_rect, height_rect) / min(width_rect, height_rect)
+            
+            # 检查是否为正方形（长宽比接近1）
+            if 0.7 <= aspect_ratio <= 1.4:
+                # 计算边长
+                side_pixels = int((width_rect + height_rect) / 2)
+                side_cm = side_pixels * pixel_to_cm_ratio
+                
+                all_shapes.append(('square', approx_adjusted, side_pixels, side_cm))
+                print(f"检测到正方形: 边长{side_pixels}像素 ({side_cm:.2f}cm)")
+                continue
+                # 圆形检测
+        if vertices >= 5:
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+            if 0.3 < circularity < 2.0:
+                # 使用轮廓的边界矩形计算更准确的圆形参数
+                rect_contour = cv2.boundingRect(contour)
+                center_x = rect_contour[0] + rect_contour[2] // 2 + x
+                center_y = rect_contour[1] + rect_contour[3] // 2 + y
+                center = (int(center_x), int(center_y))
+                
+                # 计算半径（取宽高的平均值）
+                radius = int((rect_contour[2] + rect_contour[3]) / 4)
+                diameter_pixels = radius * 2
+                diameter_cm = diameter_pixels * pixel_to_cm_ratio
+                
+                # 保存原始轮廓用于更准确的绘制
+                contour_adjusted = contour + [x, y]
+                
+                all_shapes.append(('circle', center, radius, diameter_pixels, diameter_cm, contour_adjusted))
+                print(f"检测到圆形: 中心{center}, 半径{radius}像素, 直径{diameter_pixels}像素 ({diameter_cm:.2f}cm)")
+                continue
+
+
+        # 如果无法确定具体形状，归类为多边形
+        print(f"无法确定形状类型，归类为多边形: {vertices}个顶点")
+        
+        # 计算所有边长
+        points = approx.reshape(-1, 2)
+        side_lengths = []
+        for i in range(vertices):
+            p1 = points[i]
+            p2 = points[(i + 1) % vertices]
+            length = np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+            side_lengths.append(length)
+        
+        # 过滤掉小于4cm的边长
+        side_lengths_cm = [length * pixel_to_cm_ratio for length in side_lengths]
+        valid_sides_pixels = []
+        valid_sides_cm = []
+        
+        for i, (length_pixels, length_cm) in enumerate(zip(side_lengths, side_lengths_cm)):
+            if length_cm >= 4.0:  # 只保留大于等于4cm的边长
+                valid_sides_pixels.append(length_pixels)
+                valid_sides_cm.append(length_cm)
+                print(f"  有效边{i+1}: {length_pixels:.0f}像素 ({length_cm:.2f}cm)")
+            else:
+                print(f"  过滤边{i+1}: {length_pixels:.0f}像素 ({length_cm:.2f}cm) - 小于4cm")
+        
+        # 如果没有有效边长，使用原始数据
+        if not valid_sides_pixels:
+            print("  警告: 没有大于4cm的边长，使用所有边长")
+            valid_sides_pixels = side_lengths
+            valid_sides_cm = side_lengths_cm
+        
+        # 取最长边长
+        max_side_pixels = int(max(valid_sides_pixels))
+        max_side_cm = max(valid_sides_cm)
+        
+        all_shapes.append(('polygon', approx_adjusted, vertices, max_side_pixels, max_side_cm))
+        print(f"检测到多边形: {vertices}个顶点, 最长边长{max_side_pixels}像素 ({max_side_cm:.2f}cm), 有效边数{len(valid_sides_pixels)}")
+    
+    return all_shapes
+
+# 多边形角点检测函数（借鉴参考文件的角点检测方法）
+def detect_polygon_corners(gray, rectangle, pixel_to_cm_ratio=None):
+    # 提取ROI区域
+    x, y, w, h = cv2.boundingRect(rectangle)
+    roi_gray = gray[y:y+h, x:x+w]
+    
+    polygons = []
+    
+    # 直接用Canny边缘检测（与基础检测相同参数）
+    edges_roi = cv2.Canny(roi_gray, 50, 150)
+    contours, _ = cv2.findContours(edges_roi, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    
+    roi_area = w * h
+    
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        
+        # 过滤太小和太大的轮廓（重点：过滤外边框）
+        if area < 200 or area > roi_area * 0.7:
+            continue
+        
+        # 额外过滤：检查轮廓是否靠近边界（排除外边框）
+        x_contour, y_contour, w_contour, h_contour = cv2.boundingRect(contour)
+        margin = 10
+        if (x_contour < margin or y_contour < margin or 
+            x_contour + w_contour > roi_gray.shape[1] - margin or 
+            y_contour + h_contour > roi_gray.shape[0] - margin):
+            continue
+        
+        # 轮廓近似获取角点
+        epsilon = 0.02 * cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        
+        # 调整坐标到原图
+        corners = []
+        for point in approx:
+            corner_x = point[0][0] + x
+            corner_y = point[0][1] + y
+            corners.append((corner_x, corner_y))
+        
+        vertices = len(corners)
+        
+        # 检测重叠正方形和多边形
+        if vertices >= 4:
+            # 分析凸角点和凹角点
+            convex_corners = []
+            concave_corners = []
+            
+            for i in range(vertices):
+                # 获取相邻三个点
+                p1 = corners[(i-1) % vertices]
+                p2 = corners[i]  # 当前角点
+                p3 = corners[(i+1) % vertices]
+                
+                # 计算向量
+                v1 = (p1[0] - p2[0], p1[1] - p2[1])
+                v2 = (p3[0] - p2[0], p3[1] - p2[1])
+                
+                # 计算叉积判断凸凹性
+                cross_product = v1[0] * v2[1] - v1[1] * v2[0]
+                
+                if cross_product > 0:  # 凸角点
+                    convex_corners.append((p2, i))
+                else:  # 凹角点
+                    concave_corners.append((p2, i))
+            
+            print(f"角点分析: {len(convex_corners)}个凸角点, {len(concave_corners)}个凹角点")
+            
+            # 寻找相邻凸角点之间的最小距离
+            min_distance = float('inf')
+            min_pair = None
+            
+            if len(convex_corners) >= 2:
+                for i in range(len(convex_corners)):
+                    for j in range(i+1, len(convex_corners)):
+                        p1, idx1 = convex_corners[i]
+                        p2, idx2 = convex_corners[j]
+                        
+                        # 计算距离
+                        distance = ((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)**0.5
+                        
+                        # 检查是否为相邻的凸角点
+                        idx_diff = abs(idx1 - idx2)
+                        is_adjacent = (idx_diff == 1 or idx_diff == vertices - 1 or idx_diff <= 2)
+                        
+                        if is_adjacent and distance < min_distance:
+                            min_distance = distance
+                            min_pair = (p1, p2)
+            
+            if min_pair:
+                min_distance_cm = min_distance * pixel_to_cm_ratio if pixel_to_cm_ratio else 0
+                print(f"最小凸角点距离: {min_distance:.1f}像素 ({min_distance_cm:.2f}cm)")
+                print(f"最小凸角点对: {min_pair[0]} <-> {min_pair[1]}")
+            
+            # 根据图形类型进行处理
+            if vertices == 4:
+                # 检查是否为正方形（重叠正方形检测）
+                rect_shape = cv2.boundingRect(approx)
+                aspect_ratio = rect_shape[2] / rect_shape[3]
+                if 0.7 <= aspect_ratio <= 1.3:
+                    side_pixels = int((rect_shape[2] + rect_shape[3]) / 2)
+                    side_cm = side_pixels * pixel_to_cm_ratio if pixel_to_cm_ratio else 0
+                    
+                    if side_cm >= 3.0 or pixel_to_cm_ratio is None:
+                        polygons.append(('square', corners, vertices, area, side_pixels, side_cm, convex_corners, concave_corners))
+                        print(f"重叠正方形检测: 边长{side_pixels}像素({side_cm:.1f}cm)，面积{area:.0f}")
+                    else:
+                        print(f"重叠正方形被剔除: 边长{side_cm:.1f}cm小于3cm")
+    
+    # 找到最小的图形（按边长排序）
+    if polygons:
+        smallest_polygon = min(polygons, key=lambda p: p[4])  # 按边长排序
+        _, corners, vertices, area, side_pixels, side_cm, convex_corners, concave_corners = smallest_polygon
+        print(f"检测到最小重叠正方形: 边长{side_pixels}像素({side_cm:.1f}cm)，角点坐标: {corners}")
+        return [('square', corners, side_pixels, side_cm)]
+    
+    print("未检测到重叠的正方形")
+    return []
+
+# 显示内部图形检测处理步骤
+def show_inner_shapes_detection_steps(frame, gray, binary, rectangles, inner_shapes):
+    """
+    显示内部图形检测的完整处理步骤
+    步骤1: 原始图像
+    步骤2: 矩形检测结果
+    步骤3: ROI提取
+    步骤4: 轮廓检测
+    步骤5: 形状分类
+    步骤6: 最终结果
+    """
+    if not rectangles:
+        return frame
+    
+    # 确定目标矩形（内边缘或单个矩形）
+    if len(rectangles) >= 2:
+        rectangles_with_area = [(rect, cv2.contourArea(rect)) for rect in rectangles]
+        rectangles_with_area.sort(key=lambda x: x[1])
+        target_rectangle = rectangles_with_area[0][0]
+    else:
+        target_rectangle = rectangles[0]
+    
+    x, y, w, h = cv2.boundingRect(target_rectangle)
+    roi_binary = binary[y:y+h, x:x+w]
+    roi_gray = gray[y:y+h, x:x+w]
+    
+    # 步骤1: 原始图像
+    step1 = cv2.resize(frame, (320, 240))
+    
+    # 步骤2: 矩形检测结果
+    step2_img = frame.copy()
+    for rect in rectangles:
+        cv2.drawContours(step2_img, [rect], -1, (0, 255, 0), 2)
+    # 高亮目标矩形
+    cv2.drawContours(step2_img, [target_rectangle], -1, (0, 255, 255), 3)
+    step2 = cv2.resize(step2_img, (320, 240))
+    
+    # 步骤3: ROI提取
+    step3 = cv2.resize(cv2.cvtColor(roi_gray, cv2.COLOR_GRAY2BGR), (320, 240))
+    
+    # 步骤4: 轮廓检测
+    contours, _ = cv2.findContours(roi_binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    step4_img = cv2.cvtColor(roi_binary, cv2.COLOR_GRAY2BGR)
+    cv2.drawContours(step4_img, contours, -1, (0, 255, 0), 1)
+    step4 = cv2.resize(step4_img, (320, 240))
+    
+    # 步骤5: 形状分类
+    step5_img = cv2.cvtColor(roi_gray, cv2.COLOR_GRAY2BGR)
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < 100:
+            continue
+        
+        contour_bbox = cv2.boundingRect(contour)
+        margin = 5
+        if (contour_bbox[0] < margin or contour_bbox[1] < margin or
+            contour_bbox[0] + contour_bbox[2] > w - margin or
+            contour_bbox[1] + contour_bbox[3] > h - margin):
+            continue
+        
+        epsilon = 0.04 * cv2.arcLength(contour, True)  # 与检测函数保持一致
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        vertices = len(approx)
+        perimeter = cv2.arcLength(contour, True)
+        
+        # 根据形状类型用不同颜色绘制
+        if vertices > 6:
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+            if 0.3 < circularity < 2.0:
+                cv2.drawContours(step5_img, [contour], -1, (255, 0, 0), 2)  # 蓝色圆形
+            else:
+                cv2.drawContours(step5_img, [contour], -1, (0, 165, 255), 2)  # 橙色多边形
+        elif vertices == 3:
+            cv2.drawContours(step5_img, [contour], -1, (255, 0, 255), 2)  # 紫色三角形
+        elif vertices == 4:
+            rect_shape = cv2.boundingRect(approx)
+            width_rect, height_rect = rect_shape[2], rect_shape[3]
+            aspect_ratio = max(width_rect, height_rect) / min(width_rect, height_rect)
+            if 0.7 <= aspect_ratio <= 1.4:
+                cv2.drawContours(step5_img, [contour], -1, (0, 0, 255), 2)  # 红色正方形
+            else:
+                cv2.drawContours(step5_img, [contour], -1, (0, 165, 255), 2)  # 橙色多边形
+        else:
+            cv2.drawContours(step5_img, [contour], -1, (0, 165, 255), 2)  # 橙色多边形
+    
+    step5 = cv2.resize(step5_img, (320, 240))
+    
+    # 步骤6: 最终结果
+    step6 = frame.copy()
+    for rect in rectangles:
+        cv2.drawContours(step6, [rect], -1, (0, 255, 0), 2)
+    
+    # 绘制内部图形
+    for shape_data in inner_shapes:
+        shape_type = shape_data[0]
+        if shape_type == 'circle':
+            if len(shape_data) >= 6:
+                _, center, radius, diameter_pixels, diameter_cm, contour_adjusted = shape_data
+                cv2.drawContours(step6, [contour_adjusted], -1, (255, 0, 0), 2)
+                cv2.circle(step6, center, 3, (255, 0, 0), -1)
+            else:
+                _, center, radius, diameter_pixels = shape_data
+                cv2.circle(step6, center, radius, (255, 0, 0), 2)
+                cv2.circle(step6, center, 3, (255, 0, 0), -1)
+        elif shape_type == 'square':
+            if len(shape_data) >= 4:
+                _, contour, side_pixels, side_cm = shape_data
+            else:
+                _, contour, side_pixels = shape_data
+            cv2.drawContours(step6, [contour], -1, (0, 0, 255), 2)
+        elif shape_type == 'triangle':
+            if len(shape_data) >= 4:
+                _, contour, side_pixels, side_cm = shape_data
+            else:
+                _, contour, side_pixels = shape_data
+            cv2.drawContours(step6, [contour], -1, (255, 0, 255), 2)
+        elif shape_type == 'polygon':
+            if len(shape_data) >= 5:
+                _, contour, vertices, side_pixels, side_cm = shape_data
+            else:
+                _, contour, vertices, side_pixels = shape_data
+            cv2.drawContours(step6, [contour], -1, (0, 165, 255), 2)
+            # 绘制角点
+            for point in contour:
+                center = tuple(point[0])
+                cv2.circle(step6, center, 2, (0, 255, 0), -1)
+    
+    step6 = cv2.resize(step6, (320, 240))
+    
+    # 拼接所有步骤
+    top_row = np.hstack((step1, step2, step3))
+    bottom_row = np.hstack((step4, step5, step6))
+    
+    combined = np.vstack((top_row, bottom_row))
+    
+    # 添加步骤标题
+    cv2.putText(combined, "1.Original", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(combined, "2.Rectangle Detection", (330, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(combined, "3.ROI Extraction", (650, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(combined, "4.Contour Detection", (10, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(combined, "5.Shape Classification", (330, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(combined, "6.Final Result", (650, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    return combined
+
+
+
+
+
+
+
+
+# 创建一个VideoCapture对象，并打开系统默认的摄像头（也可以打开视频或者指定的设备）
+cap = cv2.VideoCapture(11)
+
+# 不能打开摄像头
+if not cap.isOpened():
+    raise RuntimeError('Could not open camera.')
+
+# 设置帧宽和高度
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+while(cap.isOpened()):
+
+    # 返回两个参数，ret表示是否正常打开，frame是图像数组,一帧
+    ret,frame  = cap.read()
+
+    if ret:
+        # 直接显示放大的画面作为主显示
+        enlarged_frame = cv2.resize(frame, (int(width*1.5), int(height*1.5)))
+        cv2.putText(enlarged_frame, "Live Camera (1.5x Zoom) - Press 'r' for shapes, 's' for overlapping squares", 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.imshow("Live Camera View", enlarged_frame)
+
+    # 延迟1ms，并根据键盘输入返回值val，是板卡接的键盘
+    val = cv2.waitKey(1) & 0xFF
+
+    # 捕获到键盘输入's',开始重叠正方形检测
+    if val == ord('s'):
+        print("=======================================")
+        print("开始重叠正方形检测分析（角点检测方法）...")
+        
+        # 使用放大后的中心区域进行处理
+        zoomed_frame, crop_coords = get_center_crop_and_zoom(frame, CENTER_CROP_SIZE, ZOOM_FACTOR)
+        
+        # 预处理
+        gray, binary = preprocess_frame(zoomed_frame)
+        
+        # 检测矩形边框
+        rectangles = detect_rectangles(binary)
+        
+        if rectangles:
+            # 计算像素到厘米的转换比例（基于放大倍数调整）
+            base_pixel_to_cm = 0.05  # 基础转换比例，可根据实际情况调整
+            pixel_to_cm_ratio = base_pixel_to_cm / ZOOM_FACTOR
+            
+            # 检测重叠正方形（使用角点检测方法）
+            overlapping_squares = []
+            for rect in rectangles:
+                squares = detect_polygon_corners(gray, rect, pixel_to_cm_ratio)
+                overlapping_squares.extend(squares)
+            
+            if overlapping_squares:
+                # 显示结果
+                result_image = zoomed_frame.copy()
+                
+                # 绘制矩形轮廓（绿色）
+                for rect in rectangles:
+                    cv2.drawContours(result_image, [rect], -1, (0, 255, 0), 2)
+                
+                print(f"检测到 {len(overlapping_squares)} 个重叠正方形")
+                
+                # 绘制每个检测到的重叠正方形
+                colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
+                for i, shape_data in enumerate(overlapping_squares):
+                    if len(shape_data) >= 4:
+                        shape_type, corners, side_pixels, side_cm = shape_data
+                        color = colors[i % len(colors)]
+                        
+                        # 绘制角点
+                        for corner in corners:
+                            cv2.circle(result_image, corner, 5, color, -1)
+                            cv2.circle(result_image, corner, 6, (255, 255, 255), 1)
+                        
+                        # 绘制连线
+                        pts = np.array(corners, np.int32)
+                        cv2.polylines(result_image, [pts], True, color, 3)
+                        
+                        # 添加标签
+                        if corners:
+                            cv2.putText(result_image, f"Square{i+1}: {side_pixels}px ({side_cm:.1f}cm)", 
+                                      (corners[0][0], corners[0][1]-10), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        
+                        print(f"重叠正方形{i+1}: 边长 {side_pixels}像素 ({side_cm:.2f}cm)")
+                
+                cv2.imshow("Overlapping Squares Detection (Corner Method)", result_image)
+            else:
+                print("未检测到重叠的正方形")
+        else:
+            print("未检测到矩形边框，无法进行重叠正方形检测")
+        
+        print("=======================================")
+    
+    # 捕获到键盘输入'r',开始内部图形检测
+    elif val == ord('r'):
+        print("=======================================")
+        print("开始内部基础图形检测分析（圆形、正方形、三角形）...")
+        
+        # Step 1: 使用放大后的中心区域进行处理
+        zoomed_frame, crop_coords = get_center_crop_and_zoom(frame, CENTER_CROP_SIZE, ZOOM_FACTOR)
+        
+        # Step 2: 一次性预处理
+        gray, binary = preprocess_frame(zoomed_frame)
+        
+        # Step 3: 检测矩形边框
+        rectangles = detect_rectangles(binary)
+        
+        if rectangles:
+            # Step 4: 检测内部图形
+            inner_shapes = detect_inner_shapes(binary, rectangles)
+            
+            # Step 5: 显示内部图形检测处理步骤
+            steps_image = show_inner_shapes_detection_steps(zoomed_frame, gray, binary, rectangles, inner_shapes)
+            cv2.imshow("Inner Shapes Detection Steps", steps_image)
+            
+            # Step 6: 绘制最终结果
+            result_image = zoomed_frame.copy()
+            
+            # 绘制矩形轮廓（绿色）
+            for rect in rectangles:
+                cv2.drawContours(result_image, [rect], -1, (0, 255, 0), 2)
+            
+            # 绘制内部图形
+            for shape_data in inner_shapes:
+                shape_type = shape_data[0]
+                
+                if shape_type == 'circle':
+                    _, center, radius, diameter_pixels, diameter_cm, contour_adjusted = shape_data
+                    # 使用轮廓绘制更准确的圆形（蓝色）
+                    cv2.drawContours(result_image, [contour_adjusted], -1, (255, 0, 0), 2)
+                    cv2.circle(result_image, center, 3, (255, 0, 0), -1)  # 中心点
+                    # 显示直径信息
+                    cv2.putText(result_image, f"Circle D:{diameter_pixels}px ({diameter_cm:.1f}cm)", 
+                              (center[0]-80, center[1]-radius-10), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                
+                elif shape_type == 'square':
+                    _, contour, side_pixels, side_cm = shape_data
+                    # 绘制正方形（红色）
+                    cv2.drawContours(result_image, [contour], -1, (0, 0, 255), 2)
+                    # 绘制顶点（绿色圆点）
+                    for point in contour:
+                        center = tuple(point[0])
+                        cv2.circle(result_image, center, 5, (0, 255, 0), -1)  # 绿色实心圆
+                        cv2.circle(result_image, center, 6, (255, 255, 255), 1)  # 白色外圈
+                    # 显示边长信息和顶点数
+                    rect_bbox = cv2.boundingRect(contour)
+                    cv2.putText(result_image, f"Square({len(contour)}v) S:{side_pixels}px ({side_cm:.1f}cm)", 
+                              (rect_bbox[0], rect_bbox[1]-10), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                
+                elif shape_type == 'triangle':
+                    _, contour, side_pixels, side_cm = shape_data
+                    # 绘制三角形（紫色）
+                    cv2.drawContours(result_image, [contour], -1, (255, 0, 255), 2)
+                    # 绘制顶点（绿色圆点）
+                    for point in contour:
+                        center = tuple(point[0])
+                        cv2.circle(result_image, center, 5, (0, 255, 0), -1)  # 绿色实心圆
+                        cv2.circle(result_image, center, 6, (255, 255, 255), 1)  # 白色外圈
+                    # 显示边长信息和顶点数
+                    rect_bbox = cv2.boundingRect(contour)
+                    cv2.putText(result_image, f"Triangle({len(contour)}v) Min:{side_pixels}px ({side_cm:.1f}cm)", 
+                              (rect_bbox[0], rect_bbox[1]-10), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                
+                elif shape_type == 'polygon':
+                    _, contour, vertices, side_pixels, side_cm = shape_data
+                    # 绘制多边形轮廓（橙色）
+                    cv2.drawContours(result_image, [contour], -1, (0, 165, 255), 2)
+                    
+                    # 绘制角点（绿色圆点）
+                    for point in contour:
+                        center = tuple(point[0])
+                        cv2.circle(result_image, center, 5, (0, 255, 0), -1)  # 绿色实心圆
+                        cv2.circle(result_image, center, 6, (255, 255, 255), 1)  # 白色外圈
+                    
+                    # 显示信息和实际顶点数
+                    rect_bbox = cv2.boundingRect(contour)
+                    cv2.putText(result_image, f"Polygon({len(contour)}v) Max:{side_pixels}px ({side_cm:.1f}cm)", 
+                              (rect_bbox[0], rect_bbox[1]-10), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            
+            cv2.imshow("Inner Shapes Detection Result", result_image)
+            
+            # Step 7: 打印检测信息
+            print(f"检测到 {len(rectangles)} 个矩形边框")
+            print(f"检测到 {len(inner_shapes)} 个内部图形")
+            
+            for i, shape_data in enumerate(inner_shapes):
+                shape_type = shape_data[0]
+                if shape_type == 'circle':
+                    _, center, radius, diameter_pixels, diameter_cm, contour_adjusted = shape_data
+                    print(f"图形{i+1}: 圆形 - 直径 {diameter_pixels}像素 ({diameter_cm:.2f}cm), 中心{center}")
+                elif shape_type == 'square':
+                    _, contour, side_pixels, side_cm = shape_data
+                    print(f"图形{i+1}: 正方形 - 边长 {side_pixels}像素 ({side_cm:.2f}cm)")
+                elif shape_type == 'triangle':
+                    _, contour, side_pixels, side_cm = shape_data
+                    print(f"图形{i+1}: 三角形 - 最短边长 {side_pixels}像素 ({side_cm:.2f}cm)")
+                elif shape_type == 'polygon':
+                    _, contour, vertices, side_pixels, side_cm = shape_data
+                    print(f"图形{i+1}: 多边形({vertices}个顶点) - 最长边长 {side_pixels}像素 ({side_cm:.2f}cm)")
+        else:
+            print("未检测到矩形边框，无法进行内部图形检测")
+        
+        print("=======================================")
+        num += 1
+
+
+    # 若检测到按键 'q'，退出，是板卡接的键盘
+    if val == ord('q'):
+        break
+
+# 释放摄像头
+cap.release()
+# 关闭窗口
+cv2.destroyAllWindows()
